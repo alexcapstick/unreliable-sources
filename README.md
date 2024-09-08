@@ -2,7 +2,7 @@
 
 ## Introduction
 
-This repository contains the code for the paper "Training Neural Networks on Data Sources with Unknown Reliability".
+This repository contains the code for the paper "[Training Neural Networks on Data Sources with Unknown Reliability](https://arxiv.org/abs/2212.02895v2)".
 
 ### Abstract
 
