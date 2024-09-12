@@ -123,7 +123,7 @@ source_loss_weighting
 
 ## Requirements
 
-This code was tested with Python 3.11.5 and the required python packages are located in the `requirements.txt` file. To install them, run: 
+This code was tested with **Python 3.11.5 and Pip 24.0**. The required python packages are located in the `requirements.txt` file. To install them, run: 
 
 ``` bash
 pip install -r requirements.txt
