@@ -123,7 +123,16 @@ source_loss_weighting
 
 ## Requirements
 
-This code was tested with **Python 3.11.5 and Pip 24.0**. The required python packages are located in the `requirements.txt` file. To install them, run: 
+This code was tested with **python 3.11.5 and pip 24.0** and the required python packages are located in the `requirements.txt` file. 
+
+To install the correct python and pip version (`catalyst` requires pip 24.0) run:
+
+```bash
+conda create -n lap python==3.11.5 pip==24.0
+conda activate lap
+```
+
+To install the packages, run: 
 
 ``` bash
 pip install -r requirements.txt
