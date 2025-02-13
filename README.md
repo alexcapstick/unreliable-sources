@@ -2,7 +2,7 @@
 
 ## Introduction
 
-This repository contains the code to reproduce the experiments in the paper "Training Neural Networks on Data Sources with Unknown Reliability".
+This repository contains the code to reproduce the experiments in the paper **["Training Neural Networks on Data Sources with Unknown Reliability"](https://arxiv.org/abs/2212.02895)**.
 
 If you would like to implement this method on your own dataset, please use the python package [loss_adapted_plasticity](https://github.com/alexcapstick/loss_adapted_plasticity), which can be installed with:
 
