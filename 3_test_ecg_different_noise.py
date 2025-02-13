@@ -484,7 +484,7 @@ class PTB_XL(torch.utils.data.Dataset):
         .. code-block::
 
             >>> dataset = PTB_XL(
-            ...     data_path='../../data/',
+            ...     data_path='./data/',
             ...     train=True,
             ...     source_name='nurse',
             ...     sampling_rate=500,

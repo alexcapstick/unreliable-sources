@@ -8,6 +8,8 @@ import tqdm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.nn.init as init
+import torch.nn.functional as F
 from collections import OrderedDict
 import torch.utils.data as torchdata
 
@@ -17,29 +19,38 @@ from experiment_code.data_utils.dataloader_loaders import (
     get_train_data,
     get_test_data,
 )
-from experiment_code.testing_utils.testing_functions import accuracy_topk
 
 from experiment_code.utils.utils import ArgFake
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--multiple_sources_in_batch", action="store_true")
 args = parser.parse_args()
 
 CONFIG_FILE = "../../synthetic_config.yaml"
 DATA_DIR = "../../data/"
-DATASET_NAMES = ["cifar10", "cifar100", "fmnist"]
-CORRUPTION_TYPES = ["no_c", "c_cs", "c_rl", "c_lbf", "c_ns", "c_lbs", "c_no"]
+DATASET_NAMES = [
+    "cifar10",
+    "cifar100",
+    "fmnist",
+]
+CORRUPTION_TYPES = [
+    "no_c",
+    "c_cs",
+    "c_rl",
+    "c_lbf",
+    "c_ns",
+    "c_lbs",
+    "c_no",
+]
 DEVICE = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-N_RUNS = 10
-MULTIPLE_SOURCES_IN_BATCH = args.multiple_sources_in_batch
-if not MULTIPLE_SOURCES_IN_BATCH:
-    RESULTS_FILE = "../../outputs/synthetic_results/baseline/co-teaching/results.json"
-else:
-    RESULTS_FILE = "../../outputs/synthetic_results_batch_multiple_sources/baseline/coteaching/results.json"
+N_RUNS = 5
+
+RESULTS_FILE = "../../outputs/synthetic_results/baseline/co-teaching/results.json"
 
 results = {
     ds_name: {c_type: {} for c_type in CORRUPTION_TYPES} for ds_name in DATASET_NAMES
 }
+
+print("Saving to file:", RESULTS_FILE)
 
 
 def batch_label_flipping(targets, sources, corrupt_sources):
@@ -157,6 +168,81 @@ class CoTeaching(torchdata.Dataset):
 
     def __len__(self):
         return len(self.dataset)
+
+
+# the following is from https://discuss.pytorch.org/t/top-k-error-calculation/48815/3
+# with edits to the documentation and commenting.
+def accuracy_topk(output: torch.tensor, target: torch.tensor, topk: tuple = (1,)):
+    """
+    https://discuss.pytorch.org/t/top-k-error-calculation/48815/3
+
+    Computes the accuracy over the k top predictions for the specified values of k.
+
+    ref:
+    - https://pytorch.org/docs/stable/generated/torch.topk.html
+    - https://discuss.pytorch.org/t/imagenet-example-accuracy-calculation/7840
+    - https://gist.github.com/weiaicunzai/2a5ae6eac6712c70bde0630f3e76b77b
+    - https://discuss.pytorch.org/t/top-k-error-calculation/48815/2
+    - https://stackoverflow.com/questions/59474987/how-to-get-top-k-accuracy-in-semantic-segmentation-using-pytorch
+
+
+    Arguments
+    ---------
+
+    - output: torch.tensor:
+        The prediction of the model.
+
+    - target: torch.tensor:
+        The targets that each prediction corresponds to.
+
+    - topk: tuple (optional):
+        This is a tuple of values that represent the k values
+        for which the accuracy should be calculated with.
+
+
+    Returns
+    ---------
+
+    - topk_accuracies: list:
+        This returns a list of the top k accuracies for
+        the k values specified.
+
+    """
+    with torch.no_grad():
+        maxk = max(
+            topk
+        )  # max number labels we will consider in the right choices for out model
+        batch_size = target.size(0)
+        # get top maxk indicies that correspond to the most likely probability scores
+        _, y_pred = output.topk(k=maxk, dim=1)
+        y_pred = y_pred.t()  # [B, maxk] -> [maxk, B]
+
+        # expand the target tensor to the same shape as y_pred
+        target_reshaped = target.view(1, -1).expand_as(
+            y_pred
+        )  # [B] -> [B, 1] -> [maxk, B]
+        # compare the target to each of the top k predictions made by the model
+        correct = (
+            y_pred == target_reshaped
+        )  # [maxk, B] for each example we know which topk prediction matched truth
+
+        # get topk accuracy
+        list_topk_accs = []
+        for k in topk:
+            # find which of the top k predictions were correct
+            ind_which_topk_matched_truth = correct[:k]  # [maxk, B] -> [k, B]
+            # calculate the number of correct predictions
+            flattened_indicator_which_topk_matched_truth = (
+                ind_which_topk_matched_truth.reshape(-1).float()
+            )  # [k, B] -> [kB]
+            tot_correct_topk = flattened_indicator_which_topk_matched_truth.float().sum(
+                dim=0, keepdim=True
+            )  # [kB] -> [1]
+            topk_acc = tot_correct_topk / batch_size  # topk accuracy for entire batch
+            list_topk_accs.append(topk_acc)
+        return (
+            list_topk_accs  # list of topk accuracies for batch [topk1, topk2, ... etc]
+        )
 
 
 ## model class definitions
@@ -277,6 +363,141 @@ class Conv3Net(nn.Module):
         return out
 
 
+def _weights_init(m):
+    classname = m.__class__.__name__
+    # print(classname)
+    if isinstance(m, nn.Linear) or isinstance(m, nn.Conv2d):
+        init.kaiming_normal_(m.weight)
+
+
+class LambdaLayer(nn.Module):
+    def __init__(self, lambd):
+        super(LambdaLayer, self).__init__()
+        self.lambd = lambd
+
+    def forward(self, x):
+        return self.lambd(x)
+
+
+class BasicBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, in_planes, planes, stride=1, option="A"):
+        super(BasicBlock, self).__init__()
+        self.conv1 = nn.Conv2d(
+            in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False
+        )
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(
+            planes, planes, kernel_size=3, stride=1, padding=1, bias=False
+        )
+        self.bn2 = nn.BatchNorm2d(planes)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != planes:
+            if option == "A":
+                """
+                For CIFAR10 ResNet paper uses option A.
+                """
+                self.shortcut = LambdaLayer(
+                    lambda x: F.pad(
+                        x[:, :, ::2, ::2],
+                        (0, 0, 0, 0, planes // 4, planes // 4),
+                        "constant",
+                        0,
+                    )
+                )
+            elif option == "B":
+                self.shortcut = nn.Sequential(
+                    nn.Conv2d(
+                        in_planes,
+                        self.expansion * planes,
+                        kernel_size=1,
+                        stride=stride,
+                        bias=False,
+                    ),
+                    nn.BatchNorm2d(self.expansion * planes),
+                )
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        out = F.relu(out)
+        return out
+
+
+class ResNet(nn.Module):
+    def __init__(
+        self,
+        block,
+        num_blocks,
+        num_classes=10,
+    ):
+        super(ResNet, self).__init__()
+        self.in_planes = 16
+
+        self.conv1 = nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(16)
+        self.layer1 = self._make_layer(block, 16, num_blocks[0], stride=1)
+        self.layer2 = self._make_layer(block, 32, num_blocks[1], stride=2)
+        self.layer3 = self._make_layer(block, 64, num_blocks[2], stride=2)
+        self.linear = nn.Linear(64, num_classes)
+
+        self.apply(_weights_init)
+
+    def _make_layer(self, block, planes, num_blocks, stride):
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers = []
+        for stride in strides:
+            layers.append(block(self.in_planes, planes, stride))
+            self.in_planes = planes * block.expansion
+
+        return nn.Sequential(*layers)
+
+    def forward(self, X):
+        out = F.relu(self.bn1(self.conv1(X)))
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = F.avg_pool2d(out, out.size()[3])
+        out = out.view(out.size(0), -1)
+        out = self.linear(out)
+
+        return out
+
+
+def resnet20(num_classes):
+    ## https://github.com/akamaster/pytorch_resnet_cifar10
+    return ResNet(BasicBlock, [3, 3, 3], num_classes)
+
+
+class VGG(nn.Module):
+    def __init__(
+        self,
+        n_out=10,
+        criterion=nn.CrossEntropyLoss(reduction="none"),
+    ):
+        super(VGG, self).__init__()
+
+        import torchvision.models as vision_models
+
+        self.net = vision_models.vgg16_bn(
+            weights=None,
+        )
+        self.clf = nn.Linear(1000, n_out)
+        self.criterion = criterion
+
+    def forward(self, X, y=None, return_loss=False):
+        out = self.net(X)
+        out = self.clf(out)
+        if return_loss:
+            assert y is not None
+            loss = self.criterion(out, y)
+            return loss, out
+        return out
+
+
 class MLP(nn.Module):
     def __init__(
         self,
@@ -325,31 +546,32 @@ class MLP(nn.Module):
 
 def get_model(args):
     ## model initialization for different datasets
+
     if args.dataset_name == "cifar10":
-        model = Conv3Net(
-            input_dim=32,
-            in_channels=3,
-            channels=32,
-            n_out=10,
+        model = resnet20(
+            num_classes=10,
         )
-        optimizer = torch.optim.Adam(
-            model.parameters(),
-            lr=0.001,
+        optimizer = torch.optim.SGD(
+            params=model.parameters(),
+            lr=0.1,
+            momentum=0.9,
+            weight_decay=1e-4,
+            nesterov=False,
         )
-        criterion = nn.CrossEntropyLoss()
+        criterion = nn.CrossEntropyLoss(reduction="none")
 
     if args.dataset_name == "cifar100":
-        model = Conv3Net(
-            input_dim=32,
-            in_channels=3,
-            channels=32,
-            n_out=100,
+        model = resnet20(
+            num_classes=100,
         )
-        optimizer = torch.optim.Adam(
-            model.parameters(),
-            lr=0.001,
+        optimizer = torch.optim.SGD(
+            params=model.parameters(),
+            lr=0.1,
+            momentum=0.9,
+            weight_decay=1e-4,
+            nesterov=False,
         )
-        criterion = nn.CrossEntropyLoss()
+        criterion = nn.CrossEntropyLoss(reduction="none")
 
     if args.dataset_name == "fmnist":
         model = MLP(
@@ -365,7 +587,7 @@ def get_model(args):
             model.parameters(),
             lr=0.001,
         )
-        criterion = nn.CrossEntropyLoss()
+        criterion = nn.CrossEntropyLoss(reduction="none")
     return model, optimizer, criterion
 
 
@@ -392,11 +614,11 @@ for run in range(N_RUNS):
                 print("skipping this one as completed already")
                 continue
 
-            if corruption_type == "c_lbf" and MULTIPLE_SOURCES_IN_BATCH:
+            if corruption_type == "c_lbf":
                 BATCH_FLIPPING = True
                 BATCH_SHUFFLING = False
                 corruption_type = "no_c"
-            elif corruption_type == "c_lbs" and MULTIPLE_SOURCES_IN_BATCH:
+            elif corruption_type == "c_lbs":
                 BATCH_FLIPPING = False
                 BATCH_SHUFFLING = True
                 corruption_type = "no_c"
@@ -420,23 +642,20 @@ for run in range(N_RUNS):
             # dataset dependent args
 
             if args.dataset_name == "cifar10":
-                args.lr = 0.001
-                args.n_epochs = 25
-                args.epoch_decay_start = 10
+                args.n_epochs = 40
+                args.epoch_decay_start = 20
                 args.num_gradual = 10
                 args.exponent = 1
                 model_name = "Conv3Net"
 
             elif args.dataset_name == "cifar100":
-                args.lr = 0.001
-                args.n_epochs = 25
-                args.epoch_decay_start = 10
+                args.n_epochs = 40
+                args.epoch_decay_start = 20
                 args.num_gradual = 10
                 args.exponent = 1
                 model_name = "Conv3Net_100"
 
             elif args.dataset_name == "fmnist":
-                args.lr = 0.001
                 args.n_epochs = 40
                 args.epoch_decay_start = 16
                 args.num_gradual = 10
@@ -459,14 +678,14 @@ for run in range(N_RUNS):
 
                 n_corrupt_sources = yaml.load(
                     open(args.config_file, "r"), Loader=yaml.FullLoader
-                )[f"Conv3Net-{corruption_type_to_load_n_sources}-drstd"][
+                )[f"{model_name}-{corruption_type_to_load_n_sources}-drstd"][
                     "train_params"
                 ][
                     "n_corrupt_sources"
                 ]
                 n_sources = yaml.load(
                     open(args.config_file, "r"), Loader=yaml.FullLoader
-                )[f"Conv3Net-{corruption_type_to_load_n_sources}-drstd"][
+                )[f"{model_name}-{corruption_type_to_load_n_sources}-drstd"][
                     "train_params"
                 ][
                     "n_sources"
@@ -514,7 +733,7 @@ for run in range(N_RUNS):
 
             train_loader_cot = torchdata.DataLoader(
                 CoTeaching(ToMemory(train_loader.dataset, device=DEVICE)),
-                shuffle=MULTIPLE_SOURCES_IN_BATCH,
+                shuffle=True,
                 batch_size=training_params["source_size"],
             )
 
@@ -527,29 +746,6 @@ for run in range(N_RUNS):
             )
 
             forget_rate = 0.2
-            learning_rate = args.lr
-
-            # Adjust learning rate and betas for Adam Optimizer
-            mom1 = 0.9
-            mom2 = 0.1
-            alpha_plan = [learning_rate] * args.n_epochs
-            beta1_plan = [mom1] * args.n_epochs
-            for i in range(args.epoch_decay_start, args.n_epochs):
-                alpha_plan[i] = (
-                    float(args.n_epochs - i)
-                    / (args.n_epochs - args.epoch_decay_start)
-                    * learning_rate
-                )
-                beta1_plan[i] = mom2
-
-            def adjust_learning_rate(optimizer, epoch):
-                for param_group in optimizer.param_groups:
-                    param_group["lr"] = alpha_plan[epoch]
-                    param_group["betas"] = (
-                        beta1_plan[epoch],
-                        0.999,
-                    )  # Only change beta1
-
             # define drop rate schedule
             rate_schedule = np.ones(args.n_epochs) * forget_rate
             rate_schedule[: args.num_gradual] = np.linspace(
@@ -557,14 +753,13 @@ for run in range(N_RUNS):
             )
 
             # Loss functions
-            def loss_coteaching(y_1, y_2, t, forget_rate, ind):
-                loss_1 = F.cross_entropy(y_1, t, reduction="none")
-                ind_1_sorted = np.argsort(loss_1.data.cpu()).to(DEVICE)
-
+            def loss_coteaching(y_1, y_2, t, criterion1, criterion2, forget_rate):
+                loss_1 = criterion1(y_1, t)
+                ind_1_sorted = torch.argsort(loss_1)
                 loss_1_sorted = loss_1[ind_1_sorted]
 
-                loss_2 = F.cross_entropy(y_2, t, reduction="none")
-                ind_2_sorted = np.argsort(loss_2.data.cpu()).to(DEVICE)
+                loss_2 = criterion2(y_2, t)
+                ind_2_sorted = torch.argsort(loss_2)
 
                 remember_rate = 1 - forget_rate
                 num_remember = int(remember_rate * len(loss_1_sorted))
@@ -572,8 +767,8 @@ for run in range(N_RUNS):
                 ind_1_update = ind_1_sorted[:num_remember]
                 ind_2_update = ind_2_sorted[:num_remember]
                 # exchange
-                loss_1_update = F.cross_entropy(y_1[ind_2_update], t[ind_2_update])
-                loss_2_update = F.cross_entropy(y_2[ind_1_update], t[ind_1_update])
+                loss_1_update = criterion1(y_1[ind_2_update], t[ind_2_update])
+                loss_2_update = criterion2(y_2[ind_1_update], t[ind_1_update])
 
                 return (
                     torch.sum(loss_1_update) / num_remember,
@@ -606,7 +801,12 @@ for run in range(N_RUNS):
                     train_total2 += 1
                     train_correct2 += prec2
                     loss_1, loss_2 = loss_coteaching(
-                        logits1, logits2, labels, rate_schedule[epoch], ind
+                        logits1,
+                        logits2,
+                        labels,
+                        criterion1,
+                        criterion2,
+                        rate_schedule[epoch],
                     )
 
                     optimizer1.zero_grad()
@@ -664,9 +864,7 @@ for run in range(N_RUNS):
             for epoch in range(args.n_epochs):
                 # train models
                 model1.train()
-                adjust_learning_rate(optimizer1, epoch)
                 model2.train()
-                adjust_learning_rate(optimizer2, epoch)
                 train_acc1, train_acc2 = train_epoch(
                     train_loader_cot,
                     epoch,

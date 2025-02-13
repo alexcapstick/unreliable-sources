@@ -1,394 +1,920 @@
-import argparse
 import os
-import random
-import numpy as np
-import pandas as pd
-import torch
-import yaml
-from itertools import product
 from pathlib import Path
-from sklearn.metrics import f1_score
-from sklearn.metrics import precision_score
-from sklearn.metrics import recall_score
-from experiment_code.utils.utils import update_dict
-from experiment_code.data_utils.dataloader_loaders import get_train_data
-from experiment_code.models.model_code import get_model
-from experiment_code.data_utils.dataloader_loaders import get_test_data
-from experiment_code.testing_utils.testing_functions import accuracy_topk
+import argparse
+import numpy as np
+import yaml
+import tqdm
+import math
+import typing
+import json
+import time
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.nn.init as init
+import torch.utils.data as torchdata
+from catalyst.metrics import AccuracyMetric
 
+# from torch.utils.tensorboard import SummaryWriter
+import torchvision.models as vision_models
+from collections import OrderedDict
 
-parser = argparse.ArgumentParser(
-    description="Train a chosen model with different algorithms"
-)
-parser.add_argument(
-    "--dataset-name", help="The dataset to use", type=str, default="mnist"
-)
-parser.add_argument("--model-name", help="The model Name", required=True)
-parser.add_argument("--seed", help="random seed", nargs="+", type=int, default=None)
-parser.add_argument(
-    "--data-dir",
-    help="Directory for the data to be saved and loaded",
-    type=str,
-    default="./data/",
-)
-parser.add_argument(
-    "-v",
-    "--verbose",
-    help="Whether to print information as the script runs",
-    action="store_true",
-)
-parser.add_argument(
-    "--config-file",
-    help="The config file containing the model parameters and training methods",
-    type=str,
-    default="./synthetic_config.yaml",
-)
-parser.add_argument(
-    "--device", help="Device to run the models on.", type=str, default="auto"
-)
-parser.add_argument(
-    "--n-sources",
-    help="The number of sources used in the training data",
-    nargs="+",
-    type=int,
-    default=None,
-)
-parser.add_argument(
-    "--n-corrupt-sources",
-    help="The number of corrupt sources used in the training data",
-    nargs="+",
-    type=int,
-    default=None,
-)
-parser.add_argument(
-    "--source-size",
-    help="The number of data points in each source batch",
-    nargs="+",
-    type=int,
-    default=None,
-)
-parser.add_argument(
-    "--lr",
-    help="The learning rate of the training",
-    nargs="+",
-    type=float,
-    default=None,
-)
-parser.add_argument(
-    "--depression-strength",
-    help="The depression strength of the training",
-    nargs="+",
-    type=float,
-    default=None,
-)
-parser.add_argument(
-    "--history-length",
-    help="The number of previous losses to use in the depression ranking",
-    nargs="+",
-    type=int,
-    default=None,
-)
-parser.add_argument(
-    "--leniency",
-    help="The leniency used when calculating which sources to "
-    "to apply depression to. It is used in mean+leniency*std.",
-    nargs="+",
-    type=float,
-    default=None,
-)
-parser.add_argument(
-    "--warm-up",
-    help="The number of steps to hold off on applying depression "
-    "after full history is built.",
-    nargs="+",
-    type=int,
-    default=None,
-)
-parser.add_argument(
-    "--n-epochs",
-    help="The number of epochs to train for",
-    nargs="+",
-    type=int,
-    default=None,
-)
-parser.add_argument(
-    "--test-method", help="The testing method", type=str, default="traditional"
-)
+from experiment_code.utils.utils import ArgFake
+from experiment_code.data_utils.dataloader_loaders import get_train_data, get_test_data
+
+from loss_adapted_plasticity import SourceLossWeighting
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--seed", type=int, default=42)
+parser.add_argument("--runs", nargs="+", type=int, default=[1, 2, 3, 4, 5])
+parser.add_argument("--device", type=str, default="auto")
 parser.add_argument(
     "--test-dir",
     help="The directory to save the model test results",
     type=str,
     default="./outputs/synthetic_results/",
 )
-
 args = parser.parse_args()
 
 if not Path(args.test_dir).exists():
     os.makedirs(args.test_dir)
 
 
-# setting the device for running the experiment
-device = (
-    ("cuda" if torch.cuda.is_available() else "cpu")
-    if args.device == "auto"
-    else args.device
-)
+# --- experiment options
+DATASET_NAMES = [
+    "cifar10",
+    "cifar100",
+    "fmnist",
+]
 
-# the hparam names that will be used when saving the models and results
-hparam_short_name = {
-    "n_sources": "ns",
-    "n_corrupt_sources": "ncs",
-    "source_size": "ssize",
-    "lr": "lr",
-    "depression_strength": "ds",
-    "leniency": "stns",
-    "history_length": "lap_n",
-    "warm_up": "ho",
-    "n_epochs": "ne",
+CORRUPTION_TYPES = [
+    "no_c",
+    "c_cs",
+    "c_rl",
+    "c_lbf",
+    "c_ns",
+    "c_lbs",
+    "c_no",
+]
+DEVICE = (
+    torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.device == "auto"
+    else torch.device(args.device)
+)
+RUNS = [int(k) for k in args.runs]
+DATA_DIR = "./data/"
+TEST_DIR = args.test_dir
+DEPRESSION = [
+    True,
+    False,
+]
+RESULTS_FILE = os.path.join(
+    TEST_DIR,
+    f"results_{''.join([str(x) for x in RUNS])}.json",
+)
+CONFIG_FILE = "./synthetic_config.yaml"
+
+exp_seed = args.seed
+
+print("saving to", RESULTS_FILE)
+
+
+# --- model options
+LAP_HISTORY_LENGTH = 25
+DEPRESSION_STRENGTH = 1.0
+LENIENCY = 0.8
+DISCRETE_AMOUNT = 0.005
+WARMUP_ITERS = 0
+
+
+def batch_label_flipping(targets, sources, corrupt_sources):
+    mask = torch.tensor(
+        [source.item() in corrupt_sources for source in sources], device=targets.device
+    )
+    new_targets = targets.clone()
+    new_targets[mask] = torch.tensor(
+        np.random.choice(targets.cpu().numpy(), size=(1,)), device=targets.device
+    )
+    return new_targets, sources
+
+
+def batch_label_shuffle(targets, sources, corrupt_sources):
+    mask = torch.tensor(
+        [source.item() in corrupt_sources for source in sources], device=targets.device
+    )
+    new_targets = targets.clone()
+    new_targets[mask] = torch.tensor(
+        np.random.permutation(targets.cpu().numpy()), device=targets.device
+    )[mask]
+    return new_targets, sources
+
+
+results = {
+    ds_name: {c_type: {run: {} for run in RUNS} for c_type in CORRUPTION_TYPES}
+    for ds_name in DATASET_NAMES
 }
 
-hparam_list_list = []
-for arg_name in hparam_short_name.keys():
-    hparam_list = getattr(args, arg_name)
-    if hparam_list is None:
-        continue
-    else:
-        hparam_list_list.append([(arg_name, hparam) for hparam in hparam_list])
+# if results file exists, load it
+try:
+    with open(RESULTS_FILE, "r") as fp:
+        result_loaded = json.load(fp)
+    print("loaded previous results")
+    for ds_name in result_loaded.keys():
+        if ds_name not in results.keys():
+            results[ds_name] = {}
+        for c_type in result_loaded[ds_name].keys():
+            if c_type not in results[ds_name].keys():
+                results[ds_name][c_type] = {}
+            for run in result_loaded[ds_name][c_type].keys():
+                if run not in [int(k) for k in results[ds_name][c_type].keys()]:
+                    results[ds_name][c_type][int(run)] = {}
+                for depression in result_loaded[ds_name][c_type][run].keys():
+                    depression_bool = depression == "true"
+                    if depression_bool not in results[ds_name][c_type][int(run)].keys():
+                        results[ds_name][c_type][int(run)][depression_bool] = (
+                            result_loaded[ds_name][c_type][run][depression]
+                        )
+except FileNotFoundError:
+    pass
 
-# all hparam combinations stored here
-hparam_runs = list(product(*hparam_list_list))
+## dataset
 
-if args.seed is None:
-    args.seed = [np.random.randint(0, 1e6)]
 
-args.seed_list = args.seed
+class ToMemory(torch.utils.data.Dataset):
+    def __init__(self, dataset: torch.utils.data.Dataset, device="cpu"):
+        """
+        Wrapper for a dataset that stores the data
+        in memory. This is useful for speeding up
+        training when the dataset is small enough
+        to fit in memory. Note that
+        attributes of the dataset are not stored
+        in memory and so will not be directly accessible.
 
-if args.verbose:
-    print(" --------- Running {} experiments  --------- ".format(len(args.seed_list)))
+        This class stores the data in memory after the
+        first access. This means that the first epoch
+        will be slow but subsequent epochs will be fast.
 
-results = pd.DataFrame()
 
-# loop over the hparams
-for hparams in hparam_runs:
-    for seed in args.seed_list:
-        args.seed = seed
+        Examples
+        ---------
 
-        ####### Running with one of the seeds #######
-        if args.verbose:
-            print(" --------- Running with seed {} --------- ".format(args.seed))
+        .. code-block::
 
-        # setting options for reproducibility
-        random.seed(args.seed)  # python random generator
-        np.random.seed(args.seed)  # numpy random generator
-        torch.manual_seed(args.seed)  # torch seed
-        torch.cuda.manual_seed_all(args.seed)  # cuda seed
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+            >>> dataset = ToMemory(dataset)
+            >>> dataloader = torch.utils.data.DataLoader(dataset, batch_size=32)
+            >>> for epoch in range(10):
+            >>>     for batch in dataloader:
+            >>>         # do something with batch
 
-        ####### model config from file #######
-        model_config = yaml.load(open(args.config_file, "r"), Loader=yaml.FullLoader)[
-            args.model_name
-        ]
 
-        # this updates the model config with the options given in the arguments
-        for hparam in hparams:
-            param_name, param = hparam
-            if param_name in ["n_epochs"]:
-                update_dict(model_config["model_params"], {param_name: param})
-            elif param_name in ["n_sources", "n_corrupt_sources", "source_size"]:
-                update_dict(model_config, {"train_params": {param_name: param}})
-            elif param_name in ["lr", "depression_strength", "history_length"]:
-                for optim_name in model_config["model_params"][
-                    "train_optimizer"
-                ].keys():
-                    update_dict(
-                        model_config,
-                        {
-                            "model_params": {
-                                "train_optimizer": {optim_name: {param_name: param}}
-                            }
-                        },
+        Arguments
+        ---------
+
+        - dataset: torch.utils.data.Dataset:
+            The dataset that you want to store in memory.
+
+        """
+        self.dataset = dataset
+        self.device = device
+        self.memory_dataset = {}
+
+    def __getitem__(self, index):
+        if index in self.memory_dataset:
+            return self.memory_dataset[index]
+        output = self.dataset[index]
+
+        output_on_device = []
+        for i in output:
+            try:
+                output = torch.tensor(output)
+            except:
+                pass
+            try:
+                output_on_device.append(i.to(self.device))
+            except:
+                output_on_device.append(i)
+
+        self.memory_dataset[index] = output_on_device
+        return output
+
+    def __len__(self):
+        return len(self.dataset)
+
+
+## model class definitions
+class Conv3Net(nn.Module):
+    def __init__(
+        self,
+        input_dim=32,
+        in_channels=3,
+        channels=32,
+        n_out=10,
+        criterion=nn.CrossEntropyLoss(reduction="none"),
+    ):
+        super(Conv3Net, self).__init__()
+
+        self.input_dim = input_dim
+        self.channels = channels
+        self.n_out = n_out
+
+        # =============== Cov Network ===============
+        self.net = nn.Sequential(
+            OrderedDict(
+                [
+                    (
+                        "conv1",
+                        nn.Conv2d(in_channels, self.channels, 3, padding="valid"),
+                    ),
+                    ("relu1", nn.ReLU()),
+                    ("mp1", nn.MaxPool2d(2, 2)),
+                    (
+                        "conv2",
+                        nn.Conv2d(self.channels, self.channels * 2, 3, padding="valid"),
+                    ),
+                    ("relu2", nn.ReLU()),
+                    ("mp2", nn.MaxPool2d(2, 2)),
+                    (
+                        "conv3",
+                        nn.Conv2d(
+                            self.channels * 2, self.channels * 2, 3, padding="valid"
+                        ),
+                    ),
+                    ("relu3", nn.ReLU()),
+                    ("flatten", nn.Flatten()),
+                ]
+            )
+        )
+
+        # =============== Linear ===============
+        self.pm_fc = nn.Sequential(
+            OrderedDict(
+                [
+                    (
+                        "fc1",
+                        nn.Linear(
+                            self.size_of_dim_out(self.input_dim) ** 2
+                            * (self.channels * 2),
+                            64,
+                        ),
+                    ),
+                    ("relu1", nn.ReLU()),
+                ]
+            )
+        )
+
+        # =============== Classifier ===============
+        self.pm_clf = nn.Linear(64, n_out)
+
+        self.criterion = criterion
+
+        return
+
+    def _resolution_calc(
+        self,
+        dim_in: int,
+        kernel_size: int = 3,
+        stride: int = 1,
+        padding: int = 0,
+        dilation: int = 1,
+    ):
+        if padding == "valid":
+            padding = 0
+
+        if type(dim_in) == list or type(dim_in) == tuple:
+            out_h = dim_in[0]
+            out_w = dim_in[1]
+            out_h = (
+                out_h + 2 * padding - dilation * (kernel_size - 1) - 1
+            ) / stride + 1
+            out_w = (
+                out_w + 2 * padding - dilation * (kernel_size - 1) - 1
+            ) / stride + 1
+
+            return (out_h, out_w)
+
+        return int(
+            np.floor((dim_in + 2 * padding - (kernel_size - 1) - 1) / stride + 1)
+        )
+
+    def _get_conv_params(self, layer):
+        kernel_size = (
+            layer.kernel_size[0]
+            if type(layer.kernel_size) == tuple
+            else layer.kernel_size
+        )
+        stride = layer.stride[0] if type(layer.stride) == tuple else layer.stride
+        padding = layer.padding[0] if type(layer.padding) == tuple else layer.padding
+        return {"kernel_size": kernel_size, "stride": stride, "padding": padding}
+
+    def size_of_dim_out(self, dim_in):
+        out = self._resolution_calc(
+            dim_in=dim_in, **self._get_conv_params(self.net.conv1)
+        )
+        out = self._resolution_calc(dim_in=out, **self._get_conv_params(self.net.mp1))
+        out = self._resolution_calc(dim_in=out, **self._get_conv_params(self.net.conv2))
+        out = self._resolution_calc(dim_in=out, **self._get_conv_params(self.net.mp2))
+        out = self._resolution_calc(dim_in=out, **self._get_conv_params(self.net.conv3))
+
+        return out
+
+    def forward(self, X, y=None, return_loss=False):
+        out = self.pm_clf(self.pm_fc(self.net(X)))
+        if return_loss:
+            assert y is not None
+            loss = self.criterion(out, y)
+            return loss, out
+        return (out,)
+
+
+class VGG(nn.Module):
+    def __init__(
+        self,
+        n_out=10,
+        criterion=nn.CrossEntropyLoss(reduction="none"),
+    ):
+        super(VGG, self).__init__()
+
+        self.net = vision_models.vgg16_bn(
+            weights=None,
+        )
+        self.clf = nn.Linear(1000, n_out)
+        self.criterion = criterion
+
+    def forward(self, X, y=None, return_loss=False):
+        out = self.net(X)
+        out = self.clf(out)
+        if return_loss:
+            assert y is not None
+            loss = self.criterion(out, y)
+            return loss, out
+        return out
+
+
+def _weights_init(m):
+    classname = m.__class__.__name__
+    # print(classname)
+    if isinstance(m, nn.Linear) or isinstance(m, nn.Conv2d):
+        init.kaiming_normal_(m.weight)
+
+
+class LambdaLayer(nn.Module):
+    def __init__(self, lambd):
+        super(LambdaLayer, self).__init__()
+        self.lambd = lambd
+
+    def forward(self, x):
+        return self.lambd(x)
+
+
+class BasicBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, in_planes, planes, stride=1, option="A"):
+        super(BasicBlock, self).__init__()
+        self.conv1 = nn.Conv2d(
+            in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False
+        )
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(
+            planes, planes, kernel_size=3, stride=1, padding=1, bias=False
+        )
+        self.bn2 = nn.BatchNorm2d(planes)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != planes:
+            if option == "A":
+                """
+                For CIFAR10 ResNet paper uses option A.
+                """
+                self.shortcut = LambdaLayer(
+                    lambda x: F.pad(
+                        x[:, :, ::2, ::2],
+                        (0, 0, 0, 0, planes // 4, planes // 4),
+                        "constant",
+                        0,
                     )
-            elif param_name in ["leniency", "warm_up"]:
-                for optim_name in model_config["model_params"][
-                    "train_optimizer"
-                ].keys():
-                    update_dict(
-                        model_config,
-                        {
-                            "model_params": {
-                                "train_optimizer": {
-                                    optim_name: {
-                                        "depression_function_kwargs": {
-                                            param_name: param
-                                        }
-                                    }
-                                }
-                            }
-                        },
+                )
+            elif option == "B":
+                self.shortcut = nn.Sequential(
+                    nn.Conv2d(
+                        in_planes,
+                        self.expansion * planes,
+                        kernel_size=1,
+                        stride=stride,
+                        bias=False,
+                    ),
+                    nn.BatchNorm2d(self.expansion * planes),
+                )
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        out = F.relu(out)
+        return out
+
+
+class ResNet(nn.Module):
+    def __init__(
+        self,
+        block,
+        num_blocks,
+        num_classes=10,
+        criterion=nn.CrossEntropyLoss(reduction="none"),
+    ):
+        super(ResNet, self).__init__()
+        self.in_planes = 16
+
+        self.conv1 = nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(16)
+        self.layer1 = self._make_layer(block, 16, num_blocks[0], stride=1)
+        self.layer2 = self._make_layer(block, 32, num_blocks[1], stride=2)
+        self.layer3 = self._make_layer(block, 64, num_blocks[2], stride=2)
+        self.linear = nn.Linear(64, num_classes)
+
+        self.apply(_weights_init)
+
+        self.criterion = criterion
+
+    def _make_layer(self, block, planes, num_blocks, stride):
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers = []
+        for stride in strides:
+            layers.append(block(self.in_planes, planes, stride))
+            self.in_planes = planes * block.expansion
+
+        return nn.Sequential(*layers)
+
+    def forward(self, X, y=None, return_loss=False):
+        out = F.relu(self.bn1(self.conv1(X)))
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = F.avg_pool2d(out, out.size()[3])
+        out = out.view(out.size(0), -1)
+        out = self.linear(out)
+        if return_loss:
+            assert y is not None
+            loss = self.criterion(out, y)
+            return loss, out
+
+        return out
+
+
+def resnet20(num_classes, criterion=nn.CrossEntropyLoss(reduction="none")):
+    ## https://github.com/akamaster/pytorch_resnet_cifar10
+    return ResNet(BasicBlock, [3, 3, 3], num_classes, criterion)
+
+
+class MLP(nn.Module):
+    def __init__(
+        self,
+        in_features=100,
+        out_features=100,
+        hidden_layer_features=(100,),
+        dropout=0.2,
+        criterion=nn.CrossEntropyLoss(reduction="none"),
+    ):
+        super(MLP, self).__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.dropout = dropout
+
+        self.hidden_layer_features = hidden_layer_features
+
+        in_out_list = [in_features] + list(self.hidden_layer_features) + [out_features]
+
+        in_list = in_out_list[:-1][:-1]
+        out_list = in_out_list[:-1][1:]
+
+        # =============== Linear ===============
+        self.layers = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(in_value, out_value),
+                    nn.Dropout(self.dropout),
+                    nn.ReLU(),
+                )
+                for in_value, out_value in zip(in_list, out_list)
+            ]
+        )
+
+        # =============== Classifier ===============
+        self.clf = nn.Linear(in_out_list[-2], in_out_list[-1])
+        self.softmax = nn.Softmax(dim=1)
+        self.criterion = criterion
+
+    def forward(self, X, y=None, return_loss=False):
+        out = X
+        for layer in self.layers:
+            out = layer(out)
+        out = self.clf(out)
+        out = self.softmax(out)
+        if return_loss:
+            assert y is not None
+            loss = self.criterion(out, y)
+            return loss, out
+
+        return out
+
+
+def get_model(args):
+    ## model initialization for different datasets
+
+    if args.dataset_name == "cifar10":
+        model = resnet20(
+            num_classes=10,
+            criterion=nn.CrossEntropyLoss(reduction="none"),
+        )
+        optimiser = torch.optim.SGD(
+            params=model.parameters(),
+            lr=0.1,
+            momentum=0.9,
+            weight_decay=1e-4,
+            nesterov=False,
+        )
+
+    if args.dataset_name == "cifar100":
+        model = resnet20(
+            num_classes=100,
+            criterion=nn.CrossEntropyLoss(reduction="none"),
+        )
+        optimiser = torch.optim.SGD(
+            params=model.parameters(),
+            lr=0.1,
+            momentum=0.9,
+            weight_decay=1e-4,
+            nesterov=False,
+        )
+
+    if args.dataset_name == "fmnist":
+        model = MLP(
+            in_features=784,
+            out_features=10,
+            hidden_layer_features=[
+                16,
+                16,
+            ],
+            dropout=0.2,
+            criterion=nn.CrossEntropyLoss(reduction="none"),
+        )
+        optimiser = torch.optim.Adam(
+            model.parameters(),
+            lr=0.001,
+        )
+
+    return model, optimiser
+
+
+def train_batch(
+    model,
+    optimiser,
+    x,
+    y,
+    sources,
+    label_loss_weighting,
+    device,
+    warmup=True,
+    writer=None,
+):
+    model.to(device)
+    model.train()
+
+    optimiser.zero_grad()
+
+    loss, outputs = model(x, y=y, return_loss=True)
+
+    if not warmup:
+        if label_loss_weighting is not None:
+            loss = label_loss_weighting(
+                losses=loss, sources=sources, writer=writer, writer_prefix="label"
+            )
+
+    loss = torch.mean(loss)
+    loss.backward()
+    optimiser.step()
+
+    return loss.item(), outputs
+
+
+def train_epoch(
+    model,
+    train_loader,
+    optimiser,
+    device,
+    epoch_number,
+    label_loss_weighting,
+    pbar,
+    writer=None,
+):
+    model.to(device)
+
+    model.train()
+
+    train_loss = 0
+    train_total = 0
+    train_acc_meter = AccuracyMetric(topk=[1, 5], num_classes=10)
+    lr = optimiser.param_groups[0]["lr"]
+
+    for batch_idx, (inputs, targets, sources) in enumerate(train_loader):
+        inputs, targets, sources = (
+            inputs.to(device),
+            targets.to(device),
+            sources.to(device),
+        )
+        sources = sources.squeeze(-1)
+
+        if BATCH_FLIPPING:
+            targets, sources = batch_label_flipping(targets, sources, CORRUPT_SOURCES)
+        if BATCH_SHUFFLING:
+            targets, sources = batch_label_shuffle(targets, sources, CORRUPT_SOURCES)
+
+        loss, outputs = train_batch(
+            model,
+            optimiser,
+            inputs,
+            targets,
+            sources,
+            label_loss_weighting=label_loss_weighting,
+            device=device,
+            warmup=False,
+            writer=writer,
+        )
+
+        if writer is not None:
+            writer.add_scalar(
+                "Train Loss",
+                loss,
+                epoch_number * len(train_loader) + batch_idx,
+            )
+
+        train_acc_meter.update(outputs, targets)
+        train_loss += loss * targets.size(0)
+        train_total += targets.size(0)
+
+        pbar.update(1)
+
+    metrics = train_acc_meter.compute_key_value()
+
+    return train_loss / train_total, metrics["accuracy01"], metrics["accuracy05"]
+
+
+def test(model, test_loader, device):
+    model.to(device)
+    model.eval()
+
+    test_acc_meter = AccuracyMetric(topk=[1, 5], num_classes=10)
+    with torch.no_grad():
+        test_loss = 0
+        test_total = 0
+        for batch_idx, (inputs, targets) in enumerate(test_loader):
+            inputs, targets = inputs.to(device), targets.to(device)
+            loss, outputs = model(inputs, y=targets, return_loss=True)
+
+            loss = torch.mean(loss)
+            test_acc_meter.update(outputs, targets)
+            test_loss += loss.item() * targets.size(0)
+            test_total += targets.size(0)
+
+        metrics = test_acc_meter.compute_key_value()
+    return test_loss / test_total, metrics["accuracy01"], metrics["accuracy05"]
+
+
+for ds_name in DATASET_NAMES:
+    for c_type in CORRUPTION_TYPES:
+        for run in RUNS:
+            print(
+                f"for dataset {ds_name}, no. corrupt sources {c_type}",
+                f"and run {run} the following depression has been completed",
+                results[ds_name][c_type][run].keys(),
+            )
+
+
+exp_number = 0
+for run in RUNS:
+    for dataset_name in DATASET_NAMES:
+        for corruption_type in CORRUPTION_TYPES:
+            # seed same for all depression types
+            exp_seed = int(np.random.default_rng(exp_seed).integers(0, 1e9))
+            for depression in DEPRESSION:
+                exp_number += 1
+
+                if depression in results[dataset_name][corruption_type][run].keys():
+                    print(
+                        "Skipping the following experiment as already completed:",
+                        dataset_name,
+                        corruption_type,
+                        run,
+                        depression,
+                        "...",
                     )
-            else:
-                raise NotImplementedError(
-                    "Please point the hparam to the correct model_config param."
+                    continue
+
+                print(
+                    "Performing experiment",
+                    exp_number,
+                    "of",
+                    len(RUNS)
+                    * len(DATASET_NAMES)
+                    * len(CORRUPTION_TYPES)
+                    * len(DEPRESSION),
+                    "with seed",
+                    exp_seed,
+                    "...",
+                )
+                print("Dataset:", dataset_name)
+                print("Corruption type:", corruption_type)
+                print("Run:", run)
+                print("Depression:", depression)
+
+                if corruption_type == "c_lbf":
+                    BATCH_FLIPPING = True
+                    BATCH_SHUFFLING = False
+                    corruption_type = "no_c"
+                elif corruption_type == "c_lbs":
+                    BATCH_FLIPPING = False
+                    BATCH_SHUFFLING = True
+                    corruption_type = "no_c"
+                else:
+                    BATCH_FLIPPING = False
+                    BATCH_SHUFFLING = False
+
+                args = ArgFake(
+                    {
+                        "seed": exp_seed,
+                        "dataset_name": dataset_name,
+                        "model_name": "",
+                        "data_dir": DATA_DIR,
+                        "verbose": False,
+                        "config_file": CONFIG_FILE,
+                        "device": DEVICE,
+                        "corruption_type": corruption_type,
+                    }
                 )
 
-            # adding hparams to model_name
-            if param_name in hparam_short_name:
-                model_config["model_name"] += "-{}_{}".format(
-                    hparam_short_name[param_name], param
+                # dataset dependent args
+
+                # not hparam optimised for these experiments!
+                # - performance could be improved further
+                if args.dataset_name == "cifar10":
+                    args.n_epochs = 40
+                    model_name = "Conv3Net"
+
+                elif args.dataset_name == "cifar100":
+                    args.n_epochs = 40
+                    WARMUP_ITERS = 100
+                    model_name = "Conv3Net_100"
+
+                elif args.dataset_name == "fmnist":
+                    args.n_epochs = 40
+                    LAP_HISTORY_LENGTH = 50
+                    model_name = "MLP"
+
+                ## load data config files for different datasets and corruption types
+
+                training_params = yaml.load(
+                    open(args.config_file, "r"), Loader=yaml.FullLoader
+                )[f"{model_name}-{args.corruption_type}-drstd"]["train_params"]
+
+                if BATCH_FLIPPING or BATCH_SHUFFLING:
+                    if BATCH_FLIPPING:
+                        corruption_type_to_load_n_sources = "c_lbf"
+                        corruption_type = "c_lbf"
+                    elif BATCH_SHUFFLING:
+                        corruption_type_to_load_n_sources = "c_lbs"
+                        corruption_type = "c_lbs"
+
+                    n_corrupt_sources = yaml.load(
+                        open(args.config_file, "r"), Loader=yaml.FullLoader
+                    )[f"{model_name}-{corruption_type_to_load_n_sources}-drstd"][
+                        "train_params"
+                    ][
+                        "n_corrupt_sources"
+                    ]
+                    n_sources = yaml.load(
+                        open(args.config_file, "r"), Loader=yaml.FullLoader
+                    )[f"{model_name}-{corruption_type_to_load_n_sources}-drstd"][
+                        "train_params"
+                    ][
+                        "n_sources"
+                    ]
+                    CORRUPT_SOURCES = np.random.choice(
+                        n_sources, n_corrupt_sources, replace=False
+                    ).tolist()
+
+                training_params["return_sources"] = True
+
+                train_loader, _ = get_train_data(
+                    args, {"train_params": training_params}
                 )
-            else:
-                model_config["model_name"] += "-{}_{}".format(param_name, param)
-
-        if args.verbose:
-            print(" --------- Extracting the data --------- ")
-
-        ####### collating training data #######
-        train_loaders = get_train_data(args, model_config)
-
-        if args.verbose:
-            print(" --------- Getting the model --------- ")
-
-        ####### getting model #######
-        model_class = get_model(model_config)
-
-        # if semi-supervised training
-        ae_train = (
-            model_config["train_params"]["ae"]
-            if "ae" in model_config["train_params"]
-            else False
-        )
-
-        if not Path(args.test_dir + "models/").exists():
-            os.makedirs(args.test_dir + "models/")
-        if not Path(args.test_dir + "training_stats/").exists():
-            os.makedirs(args.test_dir + "training_stats/")
-
-        model_args = model_config["model_params"]
-        save_args = dict(
-            model_path=args.test_dir + "models/",
-            result_path=args.test_dir + "training_stats/",
-        )
-        model_config["model_name"] += "-seed_{}-dataset_{}".format(
-            args.seed, args.dataset_name
-        )
-
-        # building models from parameters
-        if ae_train:
-            model = model_class(
-                seed=args.seed,
-                device=device,
-                verbose=args.verbose,
-                model_name=model_config["model_name"],
-                ae_source_fit=model_config["train_params"]["ae_source_fit"],
-                clf_source_fit=model_config["train_params"]["clf_source_fit"],
-                **save_args,
-                **model_args
-            )
-        else:
-            model = model_class(
-                seed=args.seed,
-                device=device,
-                verbose=args.verbose,
-                model_name=model_config["model_name"],
-                source_fit=model_config["train_params"]["source_fit"],
-                **save_args,
-                **model_args
-            )
-
-        if args.verbose:
-            print(" --------- Model --------- ")
-            print(model)
-
-        if args.verbose:
-            print(" --------- Config --------- ")
-            print(args, model_config)
-
-        ####### running training #######
-        if args.verbose:
-            print(" --------- Training --------- ")
-
-        # fitting the models
-        if ae_train:
-            if len(train_loaders) > 2:
-                model.fit(
-                    train_labelled_loader=train_loaders[0],
-                    train_unlabelled_loader=train_loaders[1],
-                    val_labelled_loader=train_loaders[2],
-                    val_unlabelled_loader=train_loaders[3],
-                )
-            elif len(train_loaders) == 2:
-                model.fit(
-                    train_labelled_loader=train_loaders[0],
-                    train_unlabelled_loader=train_loaders[1],
-                )
-            else:
-                raise TypeError(
-                    "Wrong number of training loaders for semi-supverised learning."
-                )
-        else:
-            if len(train_loaders) > 1:
-                model.fit(train_loader=train_loaders[0], val_loader=train_loaders[1])
-            elif len(train_loaders) == 1:
-                model.fit(train_loaders[0])
-            else:
-                raise TypeError(
-                    "Wrong number of training loaders for traditional learning."
+                test_loader, _ = get_test_data(
+                    args,
+                    {
+                        "test_method": "traditional",
+                        "batch_size": training_params["source_size"],
+                    },
                 )
 
-        #### testing
+                train_loader = torchdata.DataLoader(
+                    dataset=ToMemory(train_loader.dataset, device=DEVICE),
+                    batch_size=training_params["source_size"],
+                    shuffle=True,
+                )
 
-        # loading the test config
-        test_config = yaml.load(open(args.config_file, "r"), Loader=yaml.FullLoader)[
-            "testing-procedures"
-        ][args.test_method]
-        if args.verbose:
-            print("Testing config:", test_config)
+                test_loader = torchdata.DataLoader(
+                    dataset=ToMemory(test_loader.dataset, device=DEVICE),
+                    batch_size=training_params["source_size"],
+                    shuffle=False,
+                )
 
-        test_loader, test_targets = get_test_data(args, test_config=test_config)
+                model, optimiser = get_model(args)
 
-        model_test_name = model_config["model_name"]
-        output = model.predict(test_loader=test_loader)
-        confidence, predictions = output.max(dim=1)
-        if len(torch.unique(test_targets)) > 10:
-            accuracy_top1, accuracy_top2, accuracy_top5 = accuracy_topk(
-                output, test_targets, topk=(1, 2, 5)
-            )
-            results_temp = {
-                "Run": [model_test_name] * 3,
-                "Metric": ["Accuracy", "Top 2 Accuracy", "Top 5 Accuracy"],
-                "Value": [
-                    accuracy_top1.item(),
-                    accuracy_top2.item(),
-                    accuracy_top5.item(),
-                ],
-            }
-        else:
-            accuracy_top1, accuracy_top2 = accuracy_topk(
-                output,
-                test_targets,
-                topk=(
-                    1,
-                    2,
-                ),
-            )
-            results_temp = {
-                "Run": [model_test_name] * 2,
-                "Metric": ["Accuracy", "Top 2 Accuracy"],
-                "Value": [accuracy_top1.item(), accuracy_top2.item()],
-            }
+                if depression:
+                    label_loss_weighting = SourceLossWeighting(
+                        history_length=LAP_HISTORY_LENGTH,
+                        warmup_iters=WARMUP_ITERS,
+                        depression_strength=DEPRESSION_STRENGTH,
+                        discrete_amount=DISCRETE_AMOUNT,
+                        leniency=LENIENCY,
+                    )
 
-        if len(torch.unique(test_targets)) == 2:
-            recall = recall_score(test_targets, predictions)
-            precision = precision_score(test_targets, predictions)
-            f1 = f1_score(test_targets, predictions)
-            results_temp["Run"].extend([model_test_name] * 3)
-            results_temp["Metric"].extend(["Recall", "Precision", "F1"])
-            results_temp["Value"].extend([recall, precision, f1])
+                else:
+                    label_loss_weighting = None
 
-        # collate and save results
-        results = pd.concat([results, pd.DataFrame(results_temp)])
+                # writer = SummaryWriter(
+                #     log_dir=os.path.join(
+                #         TEST_DIR,
+                #         "tb",
+                #         args.corruption_type,
+                #         dataset_name,
+                #         f"{run}",
+                #         f"{depression}",
+                #         f"{time.time().__str__().replace('.', '')}",
+                #     )
+                # )
 
-save_path = args.test_dir + args.model_name + "-" + args.dataset_name + "-results.csv"
+                writer = None
 
-results.to_csv(save_path, header=not Path(save_path).is_file(), mode="a", index=False)
+                if BATCH_FLIPPING or BATCH_SHUFFLING:
+                    corrupt_sources = CORRUPT_SOURCES
+                else:
+                    corrupt_sources = (
+                        train_loader.dataset.dataset.corrupt_sources.tolist()
+                    )
+
+                print("corrupt sources:", corrupt_sources)
+
+                results_this_train = {}
+
+                pbar = tqdm.tqdm(
+                    total=args.n_epochs * len(train_loader), desc="Training"
+                )
+
+                for epoch in range(args.n_epochs):
+                    train_loss, train_top1acc, train_top5acc = train_epoch(
+                        model=model,
+                        train_loader=train_loader,
+                        optimiser=optimiser,
+                        device=DEVICE,
+                        epoch_number=epoch,
+                        label_loss_weighting=label_loss_weighting,
+                        writer=writer,
+                        pbar=pbar,
+                    )
+                    test_loss, test_top1acc, test_top5acc = test(
+                        model, test_loader, DEVICE
+                    )
+                    if writer is not None:
+                        writer.add_scalar("Test Loss", test_loss, epoch)
+                        writer.add_scalar("Test Acc", test_top1acc, epoch)
+                        writer.add_scalar("Test Top5Acc", test_top5acc, epoch)
+
+                    results_this_train[epoch] = {
+                        "train_loss": train_loss,
+                        "train_top1acc": train_top1acc,
+                        "train_top5acc": train_top5acc,
+                        "test_loss": test_loss,
+                        "test_top1acc": test_top1acc,
+                        "test_top5acc": test_top5acc,
+                    }
+
+                    pbar.set_postfix({"test_acc": test_top1acc})
+
+                pbar.close()
+
+                results_this_train["corrupt_sources"] = corrupt_sources
+
+                results[dataset_name][corruption_type][run][
+                    depression
+                ] = results_this_train
+
+                print(results_this_train[epoch])
+
+                if writer is not None:
+                    writer.flush()
+                    writer.close()
+
+                # save results to json
+
+                with open(RESULTS_FILE, "w") as fp:
+                    json.dump(results, fp)

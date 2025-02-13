@@ -4,7 +4,6 @@ import logging
 import typing
 import torch
 import torch.nn as nn
-from torch.utils.tensorboard import SummaryWriter
 
 
 def weighted_avg_and_std(
@@ -310,7 +309,7 @@ class SourceGradientWeighting(object):
         loss: float,
         source: typing.Hashable,
         override_dep: typing.Union[bool, None] = None,
-        writer: typing.Union[SummaryWriter, None] = None,
+        writer=None,
         **kwargs,
     ):
         """
@@ -654,8 +653,9 @@ class SourceLossWeighting(nn.Module):
         movement = torch.zeros_like(stable_source).float()
 
         movement[stable_source] = torch.where(
-            mean_source_loss
-            < mean_not_source_loss + self.leniency * std_not_source_loss,
+            mean_source_loss[stable_source]
+            < mean_not_source_loss[stable_source]
+            + self.leniency * std_not_source_loss[stable_source],
             -1,
             +1,
         ).float()
@@ -665,11 +665,27 @@ class SourceLossWeighting(nn.Module):
 
         return source_unreliability
 
+    def get_source_unrelaibility(self):
+        source_list = list(self.source_order.keys())
+        # sorted source list
+        source_list = sorted(source_list)
+        source_idx = []
+        for source in source_list:
+            source_idx.append(self.source_order[source])
+
+        return [self.source_unreliability[s_i].item() for s_i in source_idx]
+
+    def get_source_order(self):
+        source_list = list(self.source_order.keys())
+        # sorted source list
+        source_list = sorted(source_list)
+        return source_list
+
     def forward(
         self,
         losses: torch.tensor,
         sources: torch.tensor,
-        writer: torch.utils.tensorboard.SummaryWriter = None,
+        writer=None,
         writer_prefix: typing.Optional[str] = None,
     ):
         """

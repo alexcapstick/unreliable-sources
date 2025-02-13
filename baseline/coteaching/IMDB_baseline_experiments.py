@@ -16,7 +16,6 @@ import torch.nn as nn
 import torch.utils.data as torchdata
 
 sys.path.append("../../")
-from experiment_code.testing_utils.testing_functions import accuracy_topk
 
 
 parser = argparse.ArgumentParser()
@@ -313,6 +312,81 @@ class CoTeaching(torchdata.Dataset):
         return len(self.dataset)
 
 
+# the following is from https://discuss.pytorch.org/t/top-k-error-calculation/48815/3
+# with edits to the documentation and commenting.
+def accuracy_topk(output: torch.tensor, target: torch.tensor, topk: tuple = (1,)):
+    """
+    https://discuss.pytorch.org/t/top-k-error-calculation/48815/3
+
+    Computes the accuracy over the k top predictions for the specified values of k.
+
+    ref:
+    - https://pytorch.org/docs/stable/generated/torch.topk.html
+    - https://discuss.pytorch.org/t/imagenet-example-accuracy-calculation/7840
+    - https://gist.github.com/weiaicunzai/2a5ae6eac6712c70bde0630f3e76b77b
+    - https://discuss.pytorch.org/t/top-k-error-calculation/48815/2
+    - https://stackoverflow.com/questions/59474987/how-to-get-top-k-accuracy-in-semantic-segmentation-using-pytorch
+
+
+    Arguments
+    ---------
+
+    - output: torch.tensor:
+        The prediction of the model.
+
+    - target: torch.tensor:
+        The targets that each prediction corresponds to.
+
+    - topk: tuple (optional):
+        This is a tuple of values that represent the k values
+        for which the accuracy should be calculated with.
+
+
+    Returns
+    ---------
+
+    - topk_accuracies: list:
+        This returns a list of the top k accuracies for
+        the k values specified.
+
+    """
+    with torch.no_grad():
+        maxk = max(
+            topk
+        )  # max number labels we will consider in the right choices for out model
+        batch_size = target.size(0)
+        # get top maxk indicies that correspond to the most likely probability scores
+        _, y_pred = output.topk(k=maxk, dim=1)
+        y_pred = y_pred.t()  # [B, maxk] -> [maxk, B]
+
+        # expand the target tensor to the same shape as y_pred
+        target_reshaped = target.view(1, -1).expand_as(
+            y_pred
+        )  # [B] -> [B, 1] -> [maxk, B]
+        # compare the target to each of the top k predictions made by the model
+        correct = (
+            y_pred == target_reshaped
+        )  # [maxk, B] for each example we know which topk prediction matched truth
+
+        # get topk accuracy
+        list_topk_accs = []
+        for k in topk:
+            # find which of the top k predictions were correct
+            ind_which_topk_matched_truth = correct[:k]  # [maxk, B] -> [k, B]
+            # calculate the number of correct predictions
+            flattened_indicator_which_topk_matched_truth = (
+                ind_which_topk_matched_truth.reshape(-1).float()
+            )  # [k, B] -> [kB]
+            tot_correct_topk = flattened_indicator_which_topk_matched_truth.float().sum(
+                dim=0, keepdim=True
+            )  # [kB] -> [1]
+            topk_acc = tot_correct_topk / batch_size  # topk accuracy for entire batch
+            list_topk_accs.append(topk_acc)
+        return (
+            list_topk_accs  # list of topk accuracies for batch [topk1, topk2, ... etc]
+        )
+
+
 class PositionalEncoding(nn.Module):
 
     def __init__(
@@ -369,19 +443,14 @@ class TransformerEncoder(nn.Module):
 
         self.criterion = criterion
 
-    def forward(self, X, y=None, return_loss=False):
+    def forward(self, X):
 
         out = X
         out = self.net(out)
         out = out.mean(dim=1)
         out = self.prediction_head(out)
 
-        if return_loss:
-            assert y is not None
-            loss = self.criterion(out, y)
-            return loss, out
-
-        return (out,)
+        return out
 
 
 class SentimentAnalysisModel(nn.Module):
@@ -540,6 +609,7 @@ for run in RUNS:
             train_loader_cot = torchdata.DataLoader(
                 CoTeaching(train_ds),
                 batch_size=BATCH_SIZE,
+                shuffle=True,
             )
             test_loader_cot = torchdata.DataLoader(
                 CoTeaching(test_dataset_memory), batch_size=BATCH_SIZE, shuffle=False

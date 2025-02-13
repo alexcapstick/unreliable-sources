@@ -7,8 +7,11 @@ import json
 import tqdm
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import torch.nn.init as init
 from collections import OrderedDict
 import torch.utils.data as torchdata
+import torchvision.models as vision_models
 
 sys.path.append("../../")
 
@@ -16,25 +19,31 @@ from experiment_code.data_utils.dataloader_loaders import (
     get_train_data,
     get_test_data,
 )
-from experiment_code.testing_utils.testing_functions import accuracy_topk
 from experiment_code.utils.utils import ArgFake
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--multiple_sources_in_batch", action="store_true")
 args = parser.parse_args()
 
 CONFIG_FILE = "../../synthetic_config.yaml"
-DATASET_NAMES = ["cifar10", "cifar100", "fmnist"]
-CORRUPTION_TYPES = ["no_c", "c_cs", "c_rl", "c_lbf", "c_ns", "c_lbs", "c_no"]
-DEVICE = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
-N_RUNS = 10
-MULTIPLE_SOURCES_IN_BATCH = args.multiple_sources_in_batch
-if not MULTIPLE_SOURCES_IN_BATCH:
-    RESULTS_FILE = "../../outputs/synthetic_results/baseline/idpa/results.json"
-else:
-    RESULTS_FILE = "../../outputs/synthetic_results_batch_multiple_sources/baseline/idpa/results.json"
-
 DATA_DIR = "../../data/"
+DATASET_NAMES = [
+    "cifar10",
+    "cifar100",
+    "fmnist",
+]
+CORRUPTION_TYPES = [
+    "no_c",
+    "c_cs",
+    "c_rl",
+    "c_lbf",
+    "c_ns",
+    "c_lbs",
+    "c_no",
+]
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+N_RUNS = 5
+RESULTS_FILE = "../../outputs/synthetic_results/baseline/idpa/results.json"
+
 
 eta_lr, eta_init = 5e-2, 0.01
 
@@ -165,6 +174,81 @@ class InstanceDependentDataset(torchdata.Dataset):
         return len(self.dataset)
 
 
+# the following is from https://discuss.pytorch.org/t/top-k-error-calculation/48815/3
+# with edits to the documentation and commenting.
+def accuracy_topk(output: torch.tensor, target: torch.tensor, topk: tuple = (1,)):
+    """
+    https://discuss.pytorch.org/t/top-k-error-calculation/48815/3
+
+    Computes the accuracy over the k top predictions for the specified values of k.
+
+    ref:
+    - https://pytorch.org/docs/stable/generated/torch.topk.html
+    - https://discuss.pytorch.org/t/imagenet-example-accuracy-calculation/7840
+    - https://gist.github.com/weiaicunzai/2a5ae6eac6712c70bde0630f3e76b77b
+    - https://discuss.pytorch.org/t/top-k-error-calculation/48815/2
+    - https://stackoverflow.com/questions/59474987/how-to-get-top-k-accuracy-in-semantic-segmentation-using-pytorch
+
+
+    Arguments
+    ---------
+
+    - output: torch.tensor:
+        The prediction of the model.
+
+    - target: torch.tensor:
+        The targets that each prediction corresponds to.
+
+    - topk: tuple (optional):
+        This is a tuple of values that represent the k values
+        for which the accuracy should be calculated with.
+
+
+    Returns
+    ---------
+
+    - topk_accuracies: list:
+        This returns a list of the top k accuracies for
+        the k values specified.
+
+    """
+    with torch.no_grad():
+        maxk = max(
+            topk
+        )  # max number labels we will consider in the right choices for out model
+        batch_size = target.size(0)
+        # get top maxk indicies that correspond to the most likely probability scores
+        _, y_pred = output.topk(k=maxk, dim=1)
+        y_pred = y_pred.t()  # [B, maxk] -> [maxk, B]
+
+        # expand the target tensor to the same shape as y_pred
+        target_reshaped = target.view(1, -1).expand_as(
+            y_pred
+        )  # [B] -> [B, 1] -> [maxk, B]
+        # compare the target to each of the top k predictions made by the model
+        correct = (
+            y_pred == target_reshaped
+        )  # [maxk, B] for each example we know which topk prediction matched truth
+
+        # get topk accuracy
+        list_topk_accs = []
+        for k in topk:
+            # find which of the top k predictions were correct
+            ind_which_topk_matched_truth = correct[:k]  # [maxk, B] -> [k, B]
+            # calculate the number of correct predictions
+            flattened_indicator_which_topk_matched_truth = (
+                ind_which_topk_matched_truth.reshape(-1).float()
+            )  # [k, B] -> [kB]
+            tot_correct_topk = flattened_indicator_which_topk_matched_truth.float().sum(
+                dim=0, keepdim=True
+            )  # [kB] -> [1]
+            topk_acc = tot_correct_topk / batch_size  # topk accuracy for entire batch
+            list_topk_accs.append(topk_acc)
+        return (
+            list_topk_accs  # list of topk accuracies for batch [topk1, topk2, ... etc]
+        )
+
+
 ## model class definitions
 class Conv3Net(nn.Module):
     def __init__(
@@ -283,6 +367,133 @@ class Conv3Net(nn.Module):
         return out
 
 
+def _weights_init(m):
+    classname = m.__class__.__name__
+    # print(classname)
+    if isinstance(m, nn.Linear) or isinstance(m, nn.Conv2d):
+        init.kaiming_normal_(m.weight)
+
+
+class LambdaLayer(nn.Module):
+    def __init__(self, lambd):
+        super(LambdaLayer, self).__init__()
+        self.lambd = lambd
+
+    def forward(self, x):
+        return self.lambd(x)
+
+
+class BasicBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, in_planes, planes, stride=1, option="A"):
+        super(BasicBlock, self).__init__()
+        self.conv1 = nn.Conv2d(
+            in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False
+        )
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(
+            planes, planes, kernel_size=3, stride=1, padding=1, bias=False
+        )
+        self.bn2 = nn.BatchNorm2d(planes)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != planes:
+            if option == "A":
+                """
+                For CIFAR10 ResNet paper uses option A.
+                """
+                self.shortcut = LambdaLayer(
+                    lambda x: F.pad(
+                        x[:, :, ::2, ::2],
+                        (0, 0, 0, 0, planes // 4, planes // 4),
+                        "constant",
+                        0,
+                    )
+                )
+            elif option == "B":
+                self.shortcut = nn.Sequential(
+                    nn.Conv2d(
+                        in_planes,
+                        self.expansion * planes,
+                        kernel_size=1,
+                        stride=stride,
+                        bias=False,
+                    ),
+                    nn.BatchNorm2d(self.expansion * planes),
+                )
+
+    def forward(self, x):
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        out = F.relu(out)
+        return out
+
+
+class ResNet(nn.Module):
+    def __init__(
+        self,
+        block,
+        num_blocks,
+        num_classes=10,
+    ):
+        super(ResNet, self).__init__()
+        self.in_planes = 16
+
+        self.conv1 = nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(16)
+        self.layer1 = self._make_layer(block, 16, num_blocks[0], stride=1)
+        self.layer2 = self._make_layer(block, 32, num_blocks[1], stride=2)
+        self.layer3 = self._make_layer(block, 64, num_blocks[2], stride=2)
+        self.linear = nn.Linear(64, num_classes)
+
+        self.apply(_weights_init)
+
+    def _make_layer(self, block, planes, num_blocks, stride):
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers = []
+        for stride in strides:
+            layers.append(block(self.in_planes, planes, stride))
+            self.in_planes = planes * block.expansion
+
+        return nn.Sequential(*layers)
+
+    def forward(self, X):
+        out = F.relu(self.bn1(self.conv1(X)))
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = F.avg_pool2d(out, out.size()[3])
+        out = out.view(out.size(0), -1)
+        out = self.linear(out)
+
+        return out
+
+
+def resnet20(num_classes):
+    ## https://github.com/akamaster/pytorch_resnet_cifar10
+    return ResNet(BasicBlock, [3, 3, 3], num_classes)
+
+
+class VGG(nn.Module):
+    def __init__(
+        self,
+        n_out=10,
+    ):
+        super(VGG, self).__init__()
+
+        self.net = vision_models.vgg16_bn(
+            weights=None,
+        )
+        self.clf = nn.Linear(1000, n_out)
+
+    def forward(self, X):
+        out = self.net(X)
+        out = self.clf(out)
+        return out
+
+
 class MLP(nn.Module):
     def __init__(
         self,
@@ -331,29 +542,30 @@ class MLP(nn.Module):
 
 def get_model(args):
     ## model initialization for different datasets
+
     if args.dataset_name == "cifar10":
-        model = Conv3Net(
-            input_dim=32,
-            in_channels=3,
-            channels=32,
-            n_out=10,
+        model = resnet20(
+            num_classes=10,
         )
-        optimizer = torch.optim.Adam(
-            model.parameters(),
-            lr=0.001,
+        optimizer = torch.optim.SGD(
+            params=model.parameters(),
+            lr=0.1,
+            momentum=0.9,
+            weight_decay=1e-4,
+            nesterov=False,
         )
         criterion = nn.CrossEntropyLoss()
 
     if args.dataset_name == "cifar100":
-        model = Conv3Net(
-            input_dim=32,
-            in_channels=3,
-            channels=32,
-            n_out=100,
+        model = resnet20(
+            num_classes=100,
         )
-        optimizer = torch.optim.Adam(
-            model.parameters(),
-            lr=0.001,
+        optimizer = torch.optim.SGD(
+            params=model.parameters(),
+            lr=0.1,
+            momentum=0.9,
+            weight_decay=1e-4,
+            nesterov=False,
         )
         criterion = nn.CrossEntropyLoss()
 
@@ -398,11 +610,11 @@ for run in range(N_RUNS):
                 print("skipping this one as completed already")
                 continue
 
-            if corruption_type == "c_lbf" and MULTIPLE_SOURCES_IN_BATCH:
+            if corruption_type == "c_lbf":
                 BATCH_FLIPPING = True
                 BATCH_SHUFFLING = False
                 corruption_type = "no_c"
-            elif corruption_type == "c_lbs" and MULTIPLE_SOURCES_IN_BATCH:
+            elif corruption_type == "c_lbs":
                 BATCH_FLIPPING = False
                 BATCH_SHUFFLING = True
                 corruption_type = "no_c"
@@ -426,17 +638,14 @@ for run in range(N_RUNS):
             # dataset dependent args
 
             if args.dataset_name == "cifar10":
-                args.lr = 0.001
-                args.n_epochs = 25
+                args.n_epochs = 40
                 model_name = "Conv3Net"
 
             elif args.dataset_name == "cifar100":
-                args.lr = 0.001
-                args.n_epochs = 25
+                args.n_epochs = 40
                 model_name = "Conv3Net_100"
 
             elif args.dataset_name == "fmnist":
-                args.lr = 0.001
                 args.n_epochs = 40
                 model_name = "MLP"
 
@@ -456,14 +665,14 @@ for run in range(N_RUNS):
 
                 n_corrupt_sources = yaml.load(
                     open(args.config_file, "r"), Loader=yaml.FullLoader
-                )[f"Conv3Net-{corruption_type_to_load_n_sources}-drstd"][
+                )[f"{model_name}-{corruption_type_to_load_n_sources}-drstd"][
                     "train_params"
                 ][
                     "n_corrupt_sources"
                 ]
                 n_sources = yaml.load(
                     open(args.config_file, "r"), Loader=yaml.FullLoader
-                )[f"Conv3Net-{corruption_type_to_load_n_sources}-drstd"][
+                )[f"{model_name}-{corruption_type_to_load_n_sources}-drstd"][
                     "train_params"
                 ][
                     "n_sources"
@@ -488,6 +697,7 @@ for run in range(N_RUNS):
             class BatchFlipShuffleDL(object):
                 def __init__(self, dl):
                     self.dl = dl
+                    self.dataset = dl.dataset
 
                 def __iter__(self):
                     for batch in self.dl:
@@ -511,7 +721,7 @@ for run in range(N_RUNS):
 
             train_loader_idd = torchdata.DataLoader(
                 InstanceDependentDataset(ToMemory(train_loader.dataset, device=DEVICE)),
-                shuffle=MULTIPLE_SOURCES_IN_BATCH,
+                shuffle=True,
                 batch_size=training_params["source_size"],
             )
 
@@ -636,9 +846,7 @@ for run in range(N_RUNS):
                 model.train()
                 time_start = time.time()
                 correct, total = 0, 0
-                eta_hist = torch.Tensor([0] * 10).to(
-                    DEVICE
-                )  ##### was commented out for some reason #####
+                eta_hist = torch.Tensor([0] * 10).to(DEVICE)
                 pbar.postfix = f"Epoch: {epoch+1}/{args.n_epochs}"
 
                 for inputs, targets, indies, pnl in train_loader_idd:
